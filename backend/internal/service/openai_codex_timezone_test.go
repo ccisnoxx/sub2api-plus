@@ -3,9 +3,13 @@
 package service
 
 import (
+	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/LuckyKuang/sub2api-plus/internal/config"
+	"github.com/LuckyKuang/sub2api-plus/internal/pkg/ctxkey"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
@@ -157,6 +161,89 @@ func TestRewriteOpenAICodexEnvironmentTimezoneForAccount(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, changed)
 	require.Equal(t, body, untouched)
+}
+
+func TestRewriteOpenAICodexEnvironmentTimezoneDiagnosticLog(t *testing.T) {
+	logSink, restore := captureStructuredLog(t)
+	defer restore()
+
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{
+			Gateway: config.GatewayConfig{
+				OpenAICodexProxyTimezones: "12=America/New_York",
+			},
+		},
+	}
+	proxyID := int64(12)
+	account := &Account{
+		ID:       42,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		ProxyID:  &proxyID,
+		Proxy:    &Proxy{ID: proxyID},
+	}
+	body := []byte(`{
+		"input":[
+			{"role":"user","content":[{"type":"input_text","text":"<environment_context><current_date>2026-01-01</current_date><timezone>Asia/Shanghai</timezone></environment_context>"}]},
+			{"role":"user","content":"Authorization: Bearer request-body-secret; Cookie: session=request-body-cookie"}
+		]
+	}`)
+	ctx := context.WithValue(context.Background(), ctxkey.RequestID, "req-timezone-1")
+
+	_, expectedDate, ok := svc.resolveOpenAICodexEnvironmentTimezone(account)
+	require.True(t, ok)
+	rewritten, changed, err := svc.rewriteOpenAICodexEnvironmentTimezoneForAccountAndLog(ctx, body, account)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Contains(t, string(rewritten), `<timezone>America/New_York</timezone>`)
+
+	require.True(t, logSink.ContainsMessageAtLevel("openai_codex_timezone_rewrite", "info"))
+	require.True(t, logSink.ContainsFieldValue("request_id", "req-timezone-1"))
+	require.True(t, logSink.ContainsFieldValue("account_id", "42"))
+	require.True(t, logSink.ContainsFieldValue("proxy_id", "12"))
+	require.True(t, logSink.ContainsFieldValue("timezone_rewrite_changed", "true"))
+	require.True(t, logSink.ContainsFieldValue("timezone_before", "Asia/Shanghai"))
+	require.True(t, logSink.ContainsFieldValue("timezone_after", "America/New_York"))
+	require.True(t, logSink.ContainsFieldValue("current_date_before", "2026-01-01"))
+	require.True(t, logSink.ContainsFieldValue("current_date_after", expectedDate))
+
+	logSink.mu.Lock()
+	defer logSink.mu.Unlock()
+	for _, event := range logSink.events {
+		serialized := event.Message + fmt.Sprint(event.Fields)
+		require.NotContains(t, serialized, "request-body-secret")
+		require.NotContains(t, serialized, "request-body-cookie")
+		require.NotContains(t, strings.ToLower(serialized), "authorization")
+		require.NotContains(t, strings.ToLower(serialized), "cookie")
+	}
+}
+
+func TestOpenAICodexTimezoneDiagnosticRejectsUntrustedTagValues(t *testing.T) {
+	logSink, restore := captureStructuredLog(t)
+	defer restore()
+
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{
+			Gateway: config.GatewayConfig{
+				OpenAICodexDirectTimezone: "America/Los_Angeles",
+			},
+		},
+	}
+	account := &Account{ID: 43, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	body := []byte(`{"input":[{"role":"user","content":"<environment_context><current_date>Cookie date-secret</current_date><timezone>Bearer timezone-secret</timezone></environment_context>"}]}`)
+
+	_, changed, err := svc.rewriteOpenAICodexEnvironmentTimezoneForAccountAndLog(context.Background(), body, account)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.True(t, logSink.ContainsFieldValue("timezone_after", "America/Los_Angeles"))
+
+	logSink.mu.Lock()
+	defer logSink.mu.Unlock()
+	for _, event := range logSink.events {
+		serialized := event.Message + fmt.Sprint(event.Fields)
+		require.NotContains(t, serialized, "timezone-secret")
+		require.NotContains(t, serialized, "date-secret")
+	}
 }
 
 func TestBuildOpenAIWSCreatePayloadRewritesTimezone(t *testing.T) {

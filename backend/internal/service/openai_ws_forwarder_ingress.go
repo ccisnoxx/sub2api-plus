@@ -280,7 +280,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				nil,
 			)
 		}
-		if rewritten, _, rewriteErr := s.rewriteOpenAICodexEnvironmentTimezoneForAccount(normalized, account); rewriteErr != nil {
+		if rewritten, _, rewriteErr := s.rewriteOpenAICodexEnvironmentTimezoneForAccountAndLog(ctx, normalized, account); rewriteErr != nil {
 			return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(
 				coderws.StatusPolicyViolation,
 				"invalid Codex environment context",

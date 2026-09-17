@@ -1,13 +1,17 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/LuckyKuang/sub2api-plus/internal/pkg/ctxkey"
+	"github.com/LuckyKuang/sub2api-plus/internal/pkg/logger"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"go.uber.org/zap"
 )
 
 const (
@@ -68,6 +72,60 @@ func (s *OpenAIGatewayService) rewriteOpenAICodexEnvironmentTimezoneForAccount(
 		return body, false, nil
 	}
 	return rewriteOpenAICodexEnvironmentTimezoneRaw(body, timezoneName, currentDate)
+}
+
+// rewriteOpenAICodexEnvironmentTimezoneForAccountAndLog 执行改写并记录严格脱敏的
+// 诊断结果。日志只包含请求关联字段、账号/代理 ID 和经过格式校验的时区/日期值，
+// 不记录请求正文、响应、Header 或凭据。
+func (s *OpenAIGatewayService) rewriteOpenAICodexEnvironmentTimezoneForAccountAndLog(
+	ctx context.Context,
+	body []byte,
+	account *Account,
+) ([]byte, bool, error) {
+	timezoneBefore, currentDateBefore := openAICodexEnvironmentTimezoneValuesRaw(body)
+	rewritten, changed, err := s.rewriteOpenAICodexEnvironmentTimezoneForAccount(body, account)
+	if err != nil {
+		return body, false, err
+	}
+	if !shouldLogOpenAICodexTimezoneRewrite(account) {
+		return rewritten, changed, nil
+	}
+
+	timezoneAfter, currentDateAfter := openAICodexEnvironmentTimezoneValuesRaw(rewritten)
+	proxyID := int64(0)
+	if account.Proxy != nil && account.Proxy.ID > 0 {
+		proxyID = account.Proxy.ID
+	} else if account.ProxyID != nil && *account.ProxyID > 0 {
+		proxyID = *account.ProxyID
+	}
+
+	requestID := ""
+	if ctx != nil {
+		requestID, _ = ctx.Value(ctxkey.RequestID).(string)
+	}
+	requestID = strings.TrimSpace(requestID)
+	if len(requestID) > 128 {
+		requestID = requestID[:128]
+	}
+
+	logger.L().Info("openai_codex_timezone_rewrite",
+		zap.String("request_id", requestID),
+		zap.Int64("account_id", account.ID),
+		zap.Int64("proxy_id", proxyID),
+		zap.Bool("timezone_rewrite_changed", changed),
+		zap.String("timezone_before", timezoneBefore),
+		zap.String("timezone_after", timezoneAfter),
+		zap.String("current_date_before", currentDateBefore),
+		zap.String("current_date_after", currentDateAfter),
+	)
+	return rewritten, changed, nil
+}
+
+func shouldLogOpenAICodexTimezoneRewrite(account *Account) bool {
+	if account == nil || !account.UsesOpenAICodexProtocol() {
+		return false
+	}
+	return account.Platform == "" || account.IsOpenAI()
 }
 
 func openAICodexProxyTimezoneForID(raw string, proxyID int64) string {
@@ -261,15 +319,8 @@ func rewriteOpenAICodexEnvironmentContextText(
 ) (string, bool) {
 	// Codex 会把 environment_context 作为独立文本 part 发送。只有整个 trim 后的 part
 	// 恰好是该块才允许改写，避免篡改用户粘贴的日志、引文或 Markdown 示例。
-	trimmed := strings.TrimSpace(text)
-	if !strings.HasPrefix(trimmed, openAICodexEnvironmentOpenTag) ||
-		!strings.HasSuffix(trimmed, openAICodexEnvironmentCloseTag) {
-		return text, false
-	}
-
-	contentStart := len(openAICodexEnvironmentOpenTag)
-	closeRelative := strings.Index(trimmed[contentStart:], openAICodexEnvironmentCloseTag)
-	if closeRelative < 0 || contentStart+closeRelative+len(openAICodexEnvironmentCloseTag) != len(trimmed) {
+	trimmed, ok := openAICodexEnvironmentContextBlock(text)
+	if !ok {
 		return text, false
 	}
 
@@ -281,6 +332,106 @@ func rewriteOpenAICodexEnvironmentContextText(
 
 	start := strings.Index(text, trimmed)
 	return text[:start] + nextBlock + text[start+len(trimmed):], true
+}
+
+func openAICodexEnvironmentContextBlock(text string) (string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, openAICodexEnvironmentOpenTag) ||
+		!strings.HasSuffix(trimmed, openAICodexEnvironmentCloseTag) {
+		return "", false
+	}
+
+	contentStart := len(openAICodexEnvironmentOpenTag)
+	closeRelative := strings.Index(trimmed[contentStart:], openAICodexEnvironmentCloseTag)
+	if closeRelative < 0 || contentStart+closeRelative+len(openAICodexEnvironmentCloseTag) != len(trimmed) {
+		return "", false
+	}
+	return trimmed, true
+}
+
+func openAICodexEnvironmentTimezoneValuesRaw(body []byte) (timezoneName, currentDate string) {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return "", ""
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return "", ""
+	}
+
+	for _, item := range input.Array() {
+		if !strings.EqualFold(strings.TrimSpace(item.Get("role").String()), "user") {
+			continue
+		}
+		content := item.Get("content")
+		if content.Type == gjson.String {
+			if timezoneName, currentDate, ok := openAICodexEnvironmentTimezoneValuesText(content.String()); ok {
+				return timezoneName, currentDate
+			}
+			continue
+		}
+		if !content.IsArray() {
+			continue
+		}
+		for _, part := range content.Array() {
+			text := ""
+			switch {
+			case part.Type == gjson.String:
+				text = part.String()
+			case part.Get("text").Type == gjson.String:
+				text = part.Get("text").String()
+			}
+			if timezoneName, currentDate, ok := openAICodexEnvironmentTimezoneValuesText(text); ok {
+				return timezoneName, currentDate
+			}
+		}
+	}
+	return "", ""
+}
+
+func openAICodexEnvironmentTimezoneValuesText(text string) (timezoneName, currentDate string, ok bool) {
+	block, ok := openAICodexEnvironmentContextBlock(text)
+	if !ok {
+		return "", "", false
+	}
+	timezoneName, _ = openAICodexEnvironmentElementValue(block, "timezone")
+	currentDate, _ = openAICodexEnvironmentElementValue(block, "current_date")
+	return sanitizeOpenAICodexDiagnosticTimezone(timezoneName),
+		sanitizeOpenAICodexDiagnosticDate(currentDate), true
+}
+
+func openAICodexEnvironmentElementValue(block, name string) (string, bool) {
+	openTag := "<" + name + ">"
+	closeTag := "</" + name + ">"
+	openIndex := strings.Index(block, openTag)
+	if openIndex < 0 {
+		return "", false
+	}
+	valueStart := openIndex + len(openTag)
+	closeRelative := strings.Index(block[valueStart:], closeTag)
+	if closeRelative < 0 {
+		return "", false
+	}
+	return strings.TrimSpace(block[valueStart : valueStart+closeRelative]), true
+}
+
+func sanitizeOpenAICodexDiagnosticTimezone(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 {
+		return ""
+	}
+	if _, err := time.LoadLocation(value); err != nil {
+		return ""
+	}
+	return value
+}
+
+func sanitizeOpenAICodexDiagnosticDate(value string) string {
+	value = strings.TrimSpace(value)
+	parsed, err := time.Parse("2006-01-02", value)
+	if err != nil || parsed.Format("2006-01-02") != value {
+		return ""
+	}
+	return value
 }
 
 func rewriteOpenAICodexEnvironmentElement(

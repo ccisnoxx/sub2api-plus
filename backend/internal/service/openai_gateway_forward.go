@@ -41,7 +41,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 	// Codex 会把本机 IANA 时区放进模型可见的 <environment_context>。
 	// 在 HTTP/WS 分流前先按实际出口改写；各原生 WS 路径也会在每轮发送前复用同一规则。
-	if rewrittenBody, _, rewriteErr := s.rewriteOpenAICodexEnvironmentTimezoneForAccount(body, account); rewriteErr != nil {
+	if rewrittenBody, _, rewriteErr := s.rewriteOpenAICodexEnvironmentTimezoneForAccountAndLog(ctx, body, account); rewriteErr != nil {
 		return nil, fmt.Errorf("rewrite OpenAI Codex environment timezone: %w", rewriteErr)
 	} else {
 		body = rewrittenBody
